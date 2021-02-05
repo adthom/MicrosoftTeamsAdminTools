@@ -1,4 +1,4 @@
-#Requires -Modules @{ ModuleVersion = '1.1.6'; ModuleName = 'MicrosoftTeams'; GUID = 'd910df43-3ca6-4c9c-a2e3-e9f45a8e2ad9' }
+#Requires -Modules @{ ModuleName = 'MicrosoftTeams'; GUID = 'd910df43-3ca6-4c9c-a2e3-e9f45a8e2ad9'; ModuleVersion = '1.1.6' }
 
 <#
     .SYNOPSIS
@@ -42,10 +42,7 @@ param(
     [int]$SleepMinutes = 15,
 
     # Specifies the directory path where logs will be created
-    [string]$LogFolderPath = ".",
-    
-    # Specifies whether the Completed/Remaining user files will be created with UPN
-    [switch]$LogEUII
+    [string]$LogFolderPath = "."
 )
 
 function Get-CsOnlineSessionFromTokens {
@@ -195,7 +192,8 @@ function Invoke-CsOnlineBatch {
             if (!(Test-Path $Path)) {
                 New-Item $Path -Force -ItemType File | Out-Null
             }
-            $UserString = $Users -Join [Environment]::NewLine
+            $WrittenUsers = @(Get-Content -Path $Path).Where({ $_ -match '^[^@]+@.+$' }) | Sort-Object -Unique
+            $UserString = $Users.Where({$_ -notin $WrittenUsers}) -Join [Environment]::NewLine
             $UserString | Out-File -FilePath $Path -Append
         }
     }
@@ -346,7 +344,7 @@ foreach ($user in $users) {
     # maximum filter string length is 32k
     # UPN is a maximum of 1024 characters, other characters total 31, so leaving enough space to ensure no conflict
     if ($filter.Length -gt 30950 -or $count -eq $users.Count) {
-        if (IsExpired $OAuthToken $ExpirationOffsetMinutes) {
+        if ((IsExpired $OAuthToken $ExpirationOffsetMinutes) -or $Session.Runspace.RunspaceStateInfo.State -ne 'Opened') {
             [PsCustomObject] @{
                 Retry = $true
                 UsersRemaining = $UsersRemaining
@@ -483,11 +481,15 @@ $Session | Remove-PSSession
             }
             foreach ($i in $poshErr) {
                 Write-Warning "Unhandled Exception: $($i.Exception.Message)"
-                Write-Log -Level Error -Message "Job finished with unhandled exception.`r`nException:$($i.Exception.Message)" -Path $LogFile
+                Write-Log -Level Error -Message "Job finished with unhandled exception.`r`nException: $($i.Exception.Message)" -Path $LogFile
+                if ($null -ne $i.InvocationInfo){
+                    Write-Log -Level Error -Message "Invocation Line: $($i.InvocationInfo.Line)" -Path $LogFile
+                    Write-Log -Level Error -Message "Script Line Number: $($i.InvocationInfo.ScriptLineNumber)" -Path $LogFile
+                }
                 $inner = $i.Exception.InnerException
                 while ($null -ne $inner) {
-                    Write-Error "Inner Exception:$($inner.Message)"
-                    Write-Log -Level Error -Message "Inner Exception:$($inner.Message)" -Path $LogFile
+                    Write-Error "Inner Exception: $($inner.Message)"
+                    Write-Log -Level Error -Message "Inner Exception: $($inner.Message)" -Path $LogFile
                     $inner = $inner.InnerException
                 }
             }
@@ -505,56 +507,57 @@ $Session | Remove-PSSession
                         $Tokens.Add($currentToken) | Out-Null
                     }
                     catch {
-                        Write-Error "Token Retrieval failed with $(@($currentResults.UsersRemaining).Count) users left in run.`r`nException:$($_.Exception.Message)"
-                        Write-Log -Level Error -Message "Token Retrieval failed with $(@($currentResults.UsersRemaining).Count) users left in run.`r`nException:$($_.Exception.Message)" -Path $LogFile
+                        Write-Error "Token Retrieval failed with $(@($currentResults.UsersRemaining).Count) users left in run.`r`nException: $($_.Exception.Message)"
+                        Write-Log -Level Error -Message "Token Retrieval failed with $(@($currentResults.UsersRemaining).Count) users left in run.`r`nException: $($_.Exception.Message)" -Path $LogFile
                         $inner = $_.Exception.InnerException
                         while ($null -ne $inner) {
-                            Write-Error "Inner Exception:$($inner.Message)"
-                            Write-Log -Level Error -Message "Inner Exception:$($inner.Message)" -Path $LogFile
+                            Write-Error "Inner Exception: $($inner.Message)"
+                            Write-Log -Level Error -Message "Inner Exception: $($inner.Message)" -Path $LogFile
                             $inner = $inner.InnerException
                         }
-                        WriteRemaining $currentResults.UsersRemaining
-                        WriteCompleted $currentResults.UsersCompleted
-                        $Jobs.Remove($finishedJob) | Out-Null
-                        continue
+                        $currentResult.Error = $true
                     }
                 }
-                # restart job with new smaller user set and new token
-                Write-Host "Retrying job for $($currentResults.UsersRemaining.Count) Users"
-                Write-Log -Level Info -Message "Retrying job for $($currentResults.UsersRemaining.Count) Users" -Path $LogFile
+                if (!$currentResult.Error){
+                    # restart job with new smaller user set and new token
+                    Write-Host "Retrying job for $($currentResults.UsersRemaining.Count) Users"
+                    Write-Log -Level Info -Message "Retrying job for $($currentResults.UsersRemaining.Count) Users" -Path $LogFile
 
-                $ArgHash = @{
-                    users                   = $currentResults.UsersRemaining
-                    ExpirationOffsetMinutes = $ExpirationOffsetMinutes
-                    OAuthToken              = $currentToken
-                    OverrideAdminDomain     = $OverrideAdminDomain
-                    RemoteScript            = $JobScript.ToString()
-                    OtherArgs               = $OtherArgs
+                    $ArgHash = @{
+                        FunctionStrings         = $FunctionStrings
+                        users                   = $currentResults.UsersRemaining
+                        ExpirationOffsetMinutes = $ExpirationOffsetMinutes
+                        OAuthToken              = $currentToken
+                        OverrideAdminDomain     = $OverrideAdminDomain
+                        RemoteScript            = $JobScript.ToString()
+                        OtherArgs               = $OtherArgs
+                    }
+            
+                    $newJob = [PSCustomObject]@{
+                        AdminUser          = $AdminUser
+                        PowerShellInstance = [PowerShell]::Create()
+                        Job                = $null
+                    }
+                    $newJob.PowerShellInstance.RunspacePool = $RunspacePool
+                    $newJob.PowerShellInstance.AddScript($BaseScript).AddParameters($ArgHash) | Out-Null
+                    $newJob.Job = $newJob.PowerShellInstance.BeginInvoke()
+                    $Jobs.Add($newJob) | Out-Null
+                    # to ensure at least one more cycle of do/while runs
+                    $RunningJobs += $newJob
                 }
-        
-                $newJob = [PSCustomObject]@{
-                    AdminUser          = $AdminUser
-                    PowerShellInstance = [PowerShell]::Create()
-                    Job                = $null
-                }
-                $newJob.PowerShellInstance.RunspacePool = $RunspacePool
-                $newJob.PowerShellInstance.AddScript($BaseScript).AddParameters($ArgHash) | Out-Null
-                $newJob.Job = $newJob.PowerShellInstance.BeginInvoke()
-                $Jobs.Add($newJob) | Out-Null
-                # to ensure at least one more cycle of do/while runs
-                $RunningJobs += $newJob
             }
             elseif ($null -ne $currentResults.Error) {
-                Write-Error "Job failed with $(@($currentResults.UsersRemaining).Count) users left in run.`r`nException:$($currentResults.Error.Message)"
-                Write-Log -Level Error -Message "Job failed with $(@($currentResults.UsersRemaining).Count) users left in run.`r`nException:$($currentResults.Error.Message)" -Path $LogFile
-                $inner = $currentResults.Error.InnerException
-                while ($null -ne $inner) {
-                    Write-Error "Inner Exception:$($inner.Message)"
-                    Write-Log -Level Error -Message "Inner Exception:$($inner.Message)" -Path $LogFile
-                    $inner = $inner.InnerException
+                if ($null -ne $currentResult.Error.Message) {
+                    Write-Error "Job failed with $(@($currentResults.UsersRemaining).Count) users left in run.`r`nException: $($currentResults.Error.Message)"
+                    Write-Log -Level Error -Message "Job failed with $(@($currentResults.UsersRemaining).Count) users left in run.`r`nException: $($currentResults.Error.Message)" -Path $LogFile
+                    $inner = $currentResults.Error.InnerException
+                    while ($null -ne $inner) {
+                        Write-Error "Inner Exception: $($inner.Message)"
+                        Write-Log -Level Error -Message "Inner Exception: $($inner.Message)" -Path $LogFile
+                        $inner = $inner.InnerException
+                    }
                 }
                 WriteRemaining $currentResults.UsersRemaining
-                WriteCompleted $currentResults.UsersCompleted
             }
 
             WriteCompleted $currentResults.UsersCompleted
@@ -708,7 +711,6 @@ $BatchParams = @{
     OtherArgs     = @($StartTime, $EndTime)
     LogFolderPath = $LogFolderPath
     LogFile       = $LogFile
-    LogEUII       = $PSBoundParameters.ContainsKey("LogEUII")
 }
 if ($PSBoundParameters.ContainsKey('UsersFilePath')) {
     $BatchParams['UsersFilePath'] = $UsersFilePath
