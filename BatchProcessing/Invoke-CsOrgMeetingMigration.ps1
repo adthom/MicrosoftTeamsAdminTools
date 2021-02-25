@@ -1,4 +1,4 @@
-#Requires -Modules @{ ModuleName = 'MicrosoftTeams'; GUID = 'd910df43-3ca6-4c9c-a2e3-e9f45a8e2ad9'; ModuleVersion = '1.1.6' }
+#Requires -Modules @{ ModuleName = 'MicrosoftTeams'; ModuleVersion = '1.1.6'; GUID = 'd910df43-3ca6-4c9c-a2e3-e9f45a8e2ad9' }
 
 <#
     .SYNOPSIS
@@ -309,7 +309,7 @@ param(
     [Object[]] $OtherArgs
 )
 $RemoteScript = [ScriptBlock]::Create($RemoteScript.ToString())
-Import-Module -Name MicrosoftTeams | Out-Null
+Import-Module -Name MicrosoftTeams -RequiredVersion 1.1.6 | Out-Null
 
 $FunctionStrings | Invoke-Expression
 
@@ -560,7 +560,7 @@ $Session | Remove-PSSession
             WriteCompleted $currentResults.UsersCompleted
 
             # output results from job
-            $currentResults.Output
+            $currentResults.Output | Select-Object -Property * -ExcludeProperty PSComputerName, RunspaceId
             # remove finished job from jobs collection
             $finishedJob.PowerShellInstance.Dispose() | Out-Null
             $Jobs.Remove($finishedJob) | Out-Null

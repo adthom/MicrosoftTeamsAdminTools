@@ -1,11 +1,11 @@
-#Requires -Modules @{ ModuleName = 'MicrosoftTeams'; GUID = 'd910df43-3ca6-4c9c-a2e3-e9f45a8e2ad9'; ModuleVersion = '1.1.6' }
+#Requires -Modules @{ ModuleName = 'MicrosoftTeams'; ModuleVersion = '1.1.6'; GUID = 'd910df43-3ca6-4c9c-a2e3-e9f45a8e2ad9' }
 
 <#
     .SYNOPSIS
-    Grants the given BroadcastMeetingPolicy
+    Starts the Meeting Migration service for SfB meetings to Teams meetings
     
     .DESCRIPTION
-    Grants the given BroadcastMeetingPolicy for all users enabled or from a user provided list.
+    Starts the Meeting Migration service for all users enabled in a Tenant or from a user provided list.
     It will run with multiple sessions from multiple administrator accounts as desired to increase parallelization.
 
     .INPUTS
@@ -15,27 +15,21 @@
     None. This script fully executes the process and outputs nothing to the pipeline. All console interaction is informational only.
 
     .EXAMPLE
-    Grant-CsBroadcastMeetingPolicyBatch -UserName admin1@contoso.com, admin2@contoso.com -PolicyName $null -IsTest $false
-    This runs a policy update for all enabled users in the tenant leveraging 2 administrator accounts for a maximum of 6 concurrent sessions
+    Get-CsOnlineDialInConferencingUserBatch -UserName admin1@contoso.com, admin2@contoso.com -IsTest $false
+    This runs a migration for the full tenant leveraging 2 administrator accounts for a maximum of 6 concurrent sessions
 
     .EXAMPLE
-    Grant-CsBroadcastMeetingPolicyBatch -UserName admin1@contoso.com -PolicyName $null -UsersFilePath .\userstomigrate.txt
-    This runs a test policy grant for the users listed in .\userstomigrate.txt using 1 administrator account
+    Get-CsOnlineDialInConferencingUserBatch -UserName admin1@contoso.com -UsersFilePath .\userstomigrate.txt
+    This runs a test migration for the users listed in .\userstomigrate.txt using 1 administrator account
 #>
 
 param(
-    #  The name of the policy instance.
-    [string]$PolicyName,
-
-    # Specifies if Grant-CsBroadcastMeetingPolicyBatch should be run with WhatIf switch, default is $true, set to $false to actually perform the change
-    [bool]$IsTest = $true,
-
     # Specifies the admin user names used to open SkypeOnline PowerShell sessions
     [Parameter(Mandatory = $true)]
     [string[]]$UserName,
 
-    # Specifies the path to the text file containing the list of User Principal Names of the users to update.
-    # If not specified, the script will run for all enabled users
+    # Specifies the path to the text file containing the list of User Principal Names of the users to migrate.
+    # If not specified, the script will run for all enabled users assigned the default TeamsUpgradePolicy
     [string]$UsersFilePath,
 
     # Specifies the directory path where logs will be created
@@ -312,7 +306,7 @@ param(
     [Object[]] $OtherArgs
 )
 $RemoteScript = [ScriptBlock]::Create($RemoteScript.ToString())
-Import-Module -Name MicrosoftTeams | Out-Null
+Import-Module -Name MicrosoftTeams -RequiredVersion 1.1.6 | Out-Null
 
 $FunctionStrings | Invoke-Expression
 
@@ -563,7 +557,7 @@ $Session | Remove-PSSession
             WriteCompleted $currentResults.UsersCompleted
 
             # output results from job
-            $currentResults.Output
+            $currentResults.Output | Select-Object -Property * -ExcludeProperty PSComputerName, RunspaceId
             # remove finished job from jobs collection
             $finishedJob.PowerShellInstance.Dispose() | Out-Null
             $Jobs.Remove($finishedJob) | Out-Null
@@ -693,9 +687,9 @@ function Write-Log {
 
 $LogFolderPath = Resolve-Path $LogFolderPath
 $LogDate = Get-Date -Format "yyyyMMdd_HHmmss"
-$LogFile = "$LogFolderPath\CsBroadcastMeetingPolicyBatch_$LogDate.log"
+$LogFile = "$LogFolderPath\CsOnlineDialInConferencingUserBatch_$LogDate.log"
 
-Write-Log -Level Info -Path $LogFile -Message "Grant-CsBroadcastMeetingPolicyBatch"
+Write-Log -Level Info -Path $LogFile -Message "Get-CsOnlineDialInConferencingUserBatch"
 
 if ($IsTest) {
     $IsTestWarning = "This is running as a test. Please add -IsTest `$false to your command in order to actually perform this action."
@@ -703,21 +697,22 @@ if ($IsTest) {
     Write-Log -Level Warn -Path $LogFile -Message $IsTestWarning
 }
 
-$FilterScript = [ScriptBlock]::Create('Enabled -eq $true')
+$FilterScript = [ScriptBlock]::Create('TeamsUpgradePolicy -eq $null -and Enabled -eq $true')
+
+$LoopScript = [ScriptBlock]::Create("Get-CsOnlineDialInConferencingUser -Identity `$_.UserPrincipalName")
+
 $JobScript = [ScriptBlock]::Create(@'
-param($filterSB, $ArgHash)
-Get-CsOnlineUser -Filter $filterSB | Grant-CsBroadcastMeetingPolicy @ArgHash
+param($filterSB, $LoopScript)
+Get-CsOnlineUser -Filter $filterSB | 
+ForEach-Object -Process $LoopScript
 '@)
 
-$ArgHash = @{
-    PolicyName = $PolicyName
-    WhatIf = $IsTest
-}
+
 $BatchParams = @{
     FilterScript  = $FilterScript
     JobScript     = $JobScript
     UserName      = $UserName
-    OtherArgs     = @($ArgHash)
+    OtherArgs     = @($LoopScript)
     LogFolderPath = $LogFolderPath
     LogEUII       = $PSBoundParameters.ContainsKey("LogEUII") -and $LogEUII
     LogFile       = $LogFile
